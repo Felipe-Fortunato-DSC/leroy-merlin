@@ -1,0 +1,5 @@
+httpx>=0.27
+pandas>=2.0
+pyarrow>=14.0
+snowflake-connector-python[pandas]>=3.12
+cryptography>=42.0
