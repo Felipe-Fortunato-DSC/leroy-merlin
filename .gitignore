@@ -4,3 +4,9 @@ __pycache__/
 .env
 credenciais_snowflake
 *.log
+
+# Evidencias: os corpos brutos sao centenas de MB por dia e o que prova e o
+# hash, nao o blob no git. A CHAVE PRIVADA nunca pode entrar no repositorio:
+# quem tem a chave consegue reassinar um dia adulterado.
+evidencias/
+.pytest_cache/

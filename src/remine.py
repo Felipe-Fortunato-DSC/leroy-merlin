@@ -50,6 +50,8 @@ def _html_do_site() -> str:
 def main() -> int:
     import httpx
 
+    from .extract import USER_AGENT
+
     print("1. baixando uma página de produto...")
     html = _html_do_site()
 
@@ -65,14 +67,14 @@ def main() -> int:
 
     chaves: set[str] = set()
     indices: set[str] = set()
-    c = httpx.Client(timeout=60, headers={"User-Agent": "leroy-price-collector/1.0"})
-    for u in chunks:
-        try:
-            body = c.get(u).text
-        except Exception:  # noqa: BLE001
-            continue
-        chaves |= set(re.findall(r"[\"']([0-9a-f]{32})[\"']", body))
-        indices |= set(re.findall(r"[\"'](production_[a-z_]+)[\"']", body))
+    with httpx.Client(timeout=60, headers={"User-Agent": USER_AGENT}) as c:
+        for u in chunks:
+            try:
+                body = c.get(u).text
+            except Exception:  # noqa: BLE001
+                continue
+            chaves |= set(re.findall(r"[\"']([0-9a-f]{32})[\"']", body))
+            indices |= set(re.findall(r"[\"'](production_[a-z_]+)[\"']", body))
 
     print(f"\n   chaves candidatas: {sorted(chaves)}")
     print(f"   índices: {sorted(indices)}")

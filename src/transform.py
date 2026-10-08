@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 
 from .regioes import REGIAO_NOME, regioes_desconhecidas, uf_de
 from .sellers import TIPO_LEROY, identifica
+from .texto import limpa
 
 log = logging.getLogger(__name__)
 
@@ -51,7 +52,18 @@ COLUNAS = [
     "TEM_ESTOQUE",
     "URL",
     "EXTRAIDO_EM",
+    # A resposta HTTP que originou a linha (ver evidencia/). Única coluna
+    # acrescentada às 23 originais.
+    "ID_EVIDENCIA",
 ]
+
+# Colunas que precisam de forma canônica no hash da linha, para que o hash
+# calculado na coleta seja o mesmo que a Snowflake recalcula das colunas.
+TIPOS_HASH = {
+    "PRECO_PROMOCIONAL": "dinheiro",
+    "PRECO_ORIGINAL": "dinheiro",
+    "EXTRAIDO_EM": "momento",
+}
 
 
 def _cat(hier: dict | None, nivel: str) -> str | None:
@@ -60,8 +72,8 @@ def _cat(hier: dict | None, nivel: str) -> str | None:
         return None
     v = hier.get(nivel)
     if isinstance(v, list):
-        return v[0] if v else None
-    return v or None
+        v = v[0] if v else None
+    return limpa(v)
 
 
 def _dec(v) -> float | None:
@@ -82,7 +94,7 @@ def stat_zerado() -> dict:
         "produtos_marketplace": 0,
         "produtos_sem_seller": 0,
         "descartados_sem_regiao": 0,
-        "descartados_sem_ean": 0,
+        "produtos_sem_ean": 0,
         "produtos_mantidos": 0,
         "linhas_geradas": 0,
         "linhas_sem_preco": 0,
@@ -99,11 +111,16 @@ def soma_stat(acc: dict, novo: dict) -> dict:
     return acc
 
 
-def normaliza(registros: list[dict], agora: datetime | None = None) -> tuple[list[dict], dict]:
+def normaliza(registros: list[dict], agora: datetime | None = None,
+              id_evidencia: str | None = None) -> tuple[list[dict], dict]:
     """Converte registros do índice em linhas SKU × região.
 
     Devolve (linhas, estatisticas). `agora` é parametrizável para que todos os
     lotes de uma mesma execução compartilhem o mesmo carimbo de tempo.
+
+    `id_evidencia` amarra cada linha à resposta HTTP que a originou. Uma
+    resposta traz até 1.000 produtos × 27 regiões, e TODAS as linhas derivadas
+    dela apontam para a mesma evidência — é a mesma prova.
     """
     agora = agora or datetime.now(timezone.utc).replace(tzinfo=None)
     linhas: list[dict] = []
@@ -128,26 +145,27 @@ def normaliza(registros: list[dict], agora: datetime | None = None) -> tuple[lis
             continue
         chaves_vistas.update(regionais)
 
-        eans = [str(e) for e in (r.get("eans") or []) if e]
-        if not eans:
-            stat["descartados_sem_ean"] += 1
-
         cod = str(r.get("product_id") or r.get("objectID") or "").strip()
         if not cod:
             continue
+
+        # Produto sem EAN é mantido: o código Leroy identifica a linha.
+        eans = [str(e) for e in (r.get("eans") or []) if e]
+        if not eans:
+            stat["produtos_sem_ean"] += 1
 
         hier = r.get("hierarchicalCategories")
         base = {
             "COD_PRODUTO": cod,
             "EAN_PRINCIPAL": eans[0] if eans else None,
             "EANS_TODOS": "|".join(eans) if eans else None,
-            "DESCRICAO": (r.get("name") or "").strip() or None,
-            "DESCRICAO_CURTA": (r.get("shortName") or "").strip() or None,
+            "DESCRICAO": limpa(r.get("name")),
+            "DESCRICAO_CURTA": limpa(r.get("shortName")),
             "CATEGORIA_N1": _cat(hier, "lvl0"),
             "CATEGORIA_N2": _cat(hier, "lvl1"),
-            "UNIDADE": r.get("unit") or None,
+            "UNIDADE": limpa(r.get("unit")),
             **vendedor,
-            "URL": r.get("url") or None,
+            "URL": limpa(r.get("url")),
             "EXTRAIDO_EM": agora,
         }
 
@@ -163,7 +181,7 @@ def normaliza(registros: list[dict], agora: datetime | None = None) -> tuple[lis
             if preco is None:
                 stat["linhas_sem_preco"] += 1
 
-            linhas.append({
+            linha = {
                 **base,
                 "REGIAO": regiao,
                 "REGIAO_NOME": REGIAO_NOME.get(regiao, regiao),
@@ -172,7 +190,9 @@ def normaliza(registros: list[dict], agora: datetime | None = None) -> tuple[lis
                 "PRECO_ORIGINAL": _dec(ra.get("originalPrice")),
                 "DISPONIVEL": bool(ra.get("available")),
                 "TEM_ESTOQUE": bool((ra.get("stock") or {}).get("hasStock")),
-            })
+                "ID_EVIDENCIA": id_evidencia,
+            }
+            linhas.append(linha)
             gerou = True
 
         if gerou:

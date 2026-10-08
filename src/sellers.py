@@ -17,6 +17,8 @@ enriquecimento com uma coluna de CNPJ em branco para preencher.
 """
 from __future__ import annotations
 
+from .texto import limpa
+
 SELLER_LEROY = "Leroy Merlin"
 
 # CNPJ e razão social lidos do rodapé de www.leroymerlin.com.br em 14/09/2026.
@@ -42,7 +44,8 @@ def identifica(sellers: list[str], marketplace_ids: list[str] | None) -> dict:
     Quando a Leroy está entre os vendedores, ela é a principal: o preço
     regional é a estrutura de preço dela.
     """
-    sellers = [s for s in (sellers or []) if s]
+    # Nome de vendedor também vem com caracteres de controle (ver texto.py).
+    sellers = [t for t in (limpa(s) for s in (sellers or [])) if t]
     ids = [i for i in (marketplace_ids or []) if i]
 
     if SELLER_LEROY in sellers:

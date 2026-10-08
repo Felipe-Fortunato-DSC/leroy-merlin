@@ -7,17 +7,26 @@ Conexão em duas modalidades, nesta ordem:
   2. O `config.py` do MCP em D:\\Dev_Projects\\MCP\\snowflake (modo local),
      reaproveitando a credencial que já existe na máquina em vez de duplicá-la.
 
-A carga é idempotente por data: cada execução apaga as linhas de EXTRAIDO_EM
-do mesmo dia antes de inserir, então rodar duas vezes no mesmo dia não duplica.
+A carga é idempotente por dia de coleta — a data de Brasília em que a
+execução começou, a mesma das evidências. Cada execução apaga os preços e as
+evidências desse dia antes de inserir: rodar duas vezes não duplica, e a base
+fica sempre com a última carga do dia.
+
+    python -m src.load_snowflake      # imprime a DDL completa
 """
 from __future__ import annotations
 
 import logging
 import os
 import sys
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
+
+from evidencia import snowflake as sf_evid
+
+from .transform import COLUNAS, TIPOS_HASH
 
 log = logging.getLogger(__name__)
 
@@ -51,10 +60,16 @@ CREATE TABLE IF NOT EXISTS {DATABASE}.{SCHEMA}.{TABELA} (
     DISPONIVEL          BOOLEAN,
     TEM_ESTOQUE         BOOLEAN,
     URL                 VARCHAR(1024),
-    EXTRAIDO_EM         TIMESTAMP_NTZ  NOT NULL
+    EXTRAIDO_EM         TIMESTAMP_NTZ  NOT NULL,
+    ID_EVIDENCIA        VARCHAR(32)
 )
-COMMENT = 'Precos Leroy Merlin por regiao comercial, incluindo marketplace. Grao: SKU x REGIAO (o indice traz um preco por regiao, nao por vendedor). Sem coluna de CNPJ: o CNPJ de vendedor de marketplace nao e exposto publicamente, e o da Leroy e constante (ver SELLER_TIPO). Fonte: indice Algolia publico production_products.'
+COMMENT = 'Precos Leroy Merlin por regiao comercial, incluindo marketplace. Grao: SKU x REGIAO (o indice traz um preco por regiao, nao por vendedor). Sem coluna de CNPJ: o CNPJ de vendedor de marketplace nao e exposto publicamente, e o da Leroy e constante (ver SELLER_TIPO). EXTRAIDO_EM e o inicio da execucao, em UTC. Fonte: indice Algolia publico production_products. Evidencias em TBL_EVIDENCIAS_TESTE.'
 """
+
+# Dia de coleta (AAAAMMDD) de uma linha de preço: a data de Brasília do início
+# da execução. EXTRAIDO_EM é gravado em UTC; uma coleta às 22h de Brasília já
+# é dia seguinte em UTC, e sem a conversão cairia na carga do dia errado.
+EXPR_DIA = "TO_CHAR(CONVERT_TIMEZONE('UTC', 'America/Sao_Paulo', {p}EXTRAIDO_EM), 'YYYYMMDD')"
 
 
 class CargaError(RuntimeError):
@@ -138,7 +153,8 @@ def conecta():
 
 
 def _prepara_df(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
+    # Só as colunas da tabela: Parquets antigos ainda trazem HASH_LINHA.
+    df = df[COLUNAS].copy()
     # write_pandas escreve datetime64[ns] em Parquet como inteiro de nanossegundos,
     # e o COPY INTO o lê como segundos desde a época — o resultado é um timestamp
     # absurdo que nem dá para consultar. Enviar texto ISO e deixar a Snowflake
@@ -149,24 +165,45 @@ def _prepara_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def prepara_tabela(conn, dia: str, recriar: bool = False) -> None:
-    """DDL e limpeza da carga do dia. Deve rodar UMA vez por execução."""
+def sql_auditoria(dia: date | None = None) -> str:
+    return sf_evid.sql_auditoria(DATABASE, SCHEMA, TABELA, COLUNAS, TIPOS_HASH,
+                                 EXPR_DIA.format(p="p."), dia)
+
+
+def ddl_completo() -> list[str]:
+    """Todos os objetos, na ordem de criação."""
+    return [
+        DDL,
+        f"ALTER TABLE {DATABASE}.{SCHEMA}.{TABELA} ADD COLUMN IF NOT EXISTS ID_EVIDENCIA VARCHAR(32)",
+        sf_evid.ddl_tabela(DATABASE, SCHEMA),
+        sf_evid.ddl_view(DATABASE, SCHEMA, TABELA, COLUNAS, TIPOS_HASH, EXPR_DIA.format(p="p.")),
+    ]
+
+
+def prepara_tabela(conn, dia: date, sigla: str, recriar: bool = False,
+                   apagar_evidencias: bool = True) -> None:
+    """DDL e limpeza da carga do dia. UMA vez por execução.
+
+    `apagar_evidencias=False` serve à recarga, que repõe só os preços.
+    """
     with conn.cursor() as cur:
         cur.execute(f"USE DATABASE {DATABASE}")
         cur.execute(f"USE SCHEMA {SCHEMA}")
         if recriar:
             log.warning("DROP TABLE %s.%s.%s (--recriar)", DATABASE, SCHEMA, TABELA)
             cur.execute(f"DROP TABLE IF EXISTS {DATABASE}.{SCHEMA}.{TABELA}")
-        cur.execute(DDL)
-        # Idempotência por dia: remove a carga anterior da mesma data.
-        cur.execute(
-            f"DELETE FROM {DATABASE}.{SCHEMA}.{TABELA} "
-            f"WHERE TO_DATE(EXTRAIDO_EM) = TO_DATE('{dia}')"
-        )
+        for cmd in ddl_completo():
+            cur.execute(cmd)
+        cur.execute(f"DELETE FROM {DATABASE}.{SCHEMA}.{TABELA} "
+                    f"WHERE {EXPR_DIA.format(p='')} = %s", (f"{dia:%Y%m%d}",))
         removidas = cur.rowcount or 0
-        if removidas:
-            log.info("removidas %d linhas da carga anterior de %s", removidas, dia)
     conn.commit()
+    if removidas:
+        log.info("removidas %d linhas de preço da carga anterior de %s", removidas, dia)
+    if apagar_evidencias:
+        n = sf_evid.apaga_dia(conn, DATABASE, SCHEMA, sigla, dia)
+        if n:
+            log.info("removidas %d evidências da carga anterior de %s", n, dia)
 
 
 def insere(conn, df: pd.DataFrame) -> int:
@@ -183,23 +220,7 @@ def insere(conn, df: pd.DataFrame) -> int:
     return n_linhas
 
 
-def carrega(linhas, recriar: bool = False) -> int:
-    """Carga de uma tacada só — para volumes que cabem em memória.
 
-    `linhas` pode ser um DataFrame ou uma lista de dicts.
-    """
-    from .transform import COLUNAS
-
-    df = linhas if isinstance(linhas, pd.DataFrame) else pd.DataFrame(linhas, columns=COLUNAS)
-    if df.empty:
-        raise CargaError("nada a carregar: não há linhas")
-
-    dia = pd.to_datetime(df["EXTRAIDO_EM"]).dt.date.iloc[0].isoformat()
-    conn = conecta()
-    try:
-        prepara_tabela(conn, dia, recriar=recriar)
-        n = insere(conn, df)
-        log.info("carregadas %d linhas -> %s.%s.%s", n, DATABASE, SCHEMA, TABELA)
-        return n
-    finally:
-        conn.close()
+if __name__ == "__main__":
+    for comando in ddl_completo():
+        print(comando.strip() + ";\n")

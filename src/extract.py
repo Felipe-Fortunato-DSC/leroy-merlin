@@ -21,11 +21,37 @@ import os
 import re
 import time
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 import httpx
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class RespostaBruta:
+    """Uma resposta HTTP com os bytes crus preservados, para evidência.
+
+    Os bytes vêm junto com os registros já parseados de propósito: o hash da
+    evidência tem de ser calculado sobre o que chegou do servidor, e qualquer
+    reserialização a partir de `registros` produziria um documento diferente.
+
+    `corpo` é liberado assim que a evidência é registrada — segurar os bytes de
+    803 lotes somaria mais de 100 MB sem necessidade.
+    """
+    registros: list[dict]
+    corpo: bytes
+    endpoint: str
+    parametros: dict
+    servidor_date: str | None = None
+    dt_requisicao: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    def libera(self) -> None:
+        self.corpo = b""
+
 
 # --- Credenciais públicas do índice -----------------------------------------
 # Publicadas de propósito nos bundles JS do site (é assim que busca no navegador
@@ -36,7 +62,6 @@ ALGOLIA_API_KEY = os.getenv("ALGOLIA_API_KEY", "28e054533dcdd3d71379fc3f38e78f1e
 ALGOLIA_INDEX = os.getenv("ALGOLIA_INDEX", "production_products")
 
 SITEMAP_TMPL = "https://cdn.leroymerlin.com.br/sitemaps/produtos_{n}.xml"
-SITEMAP_INDEX = "https://www.leroymerlin.com.br/sitemaps/sitemap_index.xml"
 
 USER_AGENT = os.getenv(
     "LEROY_USER_AGENT",
@@ -59,6 +84,9 @@ ATTRS = [
 ]
 
 BATCH = 1000  # teto do getObjects
+
+_RE_LOC = re.compile(r"<loc>(.*?)</loc>")
+_RE_ID_URL = re.compile(r"_(\d+)$")  # .../nome-do-produto_92236424
 
 
 class ExtracaoError(RuntimeError):
@@ -133,22 +161,39 @@ def _descobre_sitemaps(max_sitemaps: int) -> list[int]:
     return existentes
 
 
-def _baixa_sitemap(n: int, tentativas: int = 3) -> list[str]:
+def _baixa_sitemap(n: int, tentativas: int = 3) -> RespostaBruta:
+    url = SITEMAP_TMPL.format(n=n)
     with _client(120) as c:
         for i in range(tentativas):
             try:
-                r = c.get(SITEMAP_TMPL.format(n=n))
+                t0 = datetime.now(timezone.utc)
+                r = c.get(url)
                 r.raise_for_status()
-                return re.findall(r"<loc>(.*?)</loc>", r.text)
+                return RespostaBruta(
+                    registros=[{"loc": u} for u in _RE_LOC.findall(r.text)],
+                    corpo=r.content,
+                    endpoint=url,
+                    parametros={"sitemap": n},
+                    servidor_date=r.headers.get("date"),
+                    dt_requisicao=t0,
+                )
             except Exception as exc:  # noqa: BLE001
                 if i == tentativas - 1:
                     raise ExtracaoError(f"sitemap produtos_{n}.xml falhou: {exc}") from exc
                 time.sleep(2 * (i + 1))
-    return []
+    raise ExtracaoError(f"sitemap produtos_{n}.xml esgotou as tentativas")
 
 
-def coleta_ids(max_sitemaps: int = 60, workers: int = 6) -> list[str]:
-    """IDs de produto do sitemap, em ordem estável e sem duplicatas."""
+def coleta_ids(max_sitemaps: int = 60, workers: int = 6,
+               ao_receber: Callable[[RespostaBruta], None] | None = None) -> list[str]:
+    """IDs de produto do sitemap, em ordem estável e sem duplicatas.
+
+    `ao_receber` é chamado com cada sitemap baixado, antes de os IDs serem
+    extraídos — é onde o chamador registra a evidência. O sitemap é
+    proveniência de verdade: é ele que define QUAIS produtos foram pedidos, e
+    sem ele um auditor não distingue "produto ausente do catálogo" de
+    "produto que deixamos de pedir".
+    """
     t0 = time.time()
     numeros = _descobre_sitemaps(max_sitemaps)
 
@@ -157,9 +202,14 @@ def coleta_ids(max_sitemaps: int = 60, workers: int = 6) -> list[str]:
     with ThreadPoolExecutor(workers) as ex:
         resultados = list(ex.map(_baixa_sitemap, numeros))
 
-    for n, urls in zip(numeros, resultados):
+    for n, resp in zip(numeros, resultados):
+        # Evidência primeiro, dado depois — a mesma ordem da coleta de preços.
+        if ao_receber is not None:
+            ao_receber(resp)
+        urls = [r["loc"] for r in resp.registros]
+        resp.libera()
         for u in urls:
-            m = re.search(r"_(\d+)$", u)
+            m = _RE_ID_URL.search(u)
             if m and m.group(1) not in vistos:
                 vistos.add(m.group(1))
                 ids.append(m.group(1))
@@ -175,7 +225,7 @@ def coleta_ids(max_sitemaps: int = 60, workers: int = 6) -> list[str]:
 # ---------------------------------------------------------------------------
 # 2. Registros, a partir do índice Algolia
 # ---------------------------------------------------------------------------
-def _get_objects(client: httpx.Client, lote: list[str], tentativas: int = 4) -> list[dict]:
+def _get_objects(client: httpx.Client, lote: list[str], tentativas: int = 4) -> RespostaBruta:
     body = {
         "requests": [
             {"indexName": ALGOLIA_INDEX, "objectID": i, "attributesToRetrieve": ATTRS}
@@ -185,18 +235,33 @@ def _get_objects(client: httpx.Client, lote: list[str], tentativas: int = 4) -> 
     url = f"https://{ALGOLIA_APP_ID}-dsn.algolia.net/1/indexes/*/objects"
     for i in range(tentativas):
         try:
+            # O instante é medido ANTES do envio: é o que a evidência afirma
+            # sobre quando o preço foi observado. Medir depois embutiria a
+            # latência da rede no carimbo.
+            t0 = datetime.now(timezone.utc)
             r = client.post(url, json=body)
             if r.status_code == 429:
                 time.sleep(2 ** i)
                 continue
             r.raise_for_status()
-            # posições sem correspondência voltam como null
-            return [h for h in r.json().get("results", []) if h]
+            return RespostaBruta(
+                # posições sem correspondência voltam como null
+                registros=[h for h in r.json().get("results", []) if h],
+                corpo=r.content,            # bytes crus, nunca r.text
+                endpoint=url,
+                parametros={
+                    "indice": ALGOLIA_INDEX,
+                    "atributos": list(ATTRS),
+                    "object_ids": list(lote),
+                },
+                servidor_date=r.headers.get("date"),
+                dt_requisicao=t0,
+            )
         except Exception as exc:  # noqa: BLE001
             if i == tentativas - 1:
                 raise ExtracaoError(f"getObjects falhou após {tentativas} tentativas: {exc}") from exc
             time.sleep(2 ** i)
-    return []
+    raise ExtracaoError("getObjects esgotou as tentativas sem resposta utilizável")
 
 
 def valida_credenciais() -> None:
@@ -236,7 +301,9 @@ def itera_registros(ids: list[str], workers: int = 4, janela: int | None = None)
     Aqui mantemos no máximo `janela` lotes em voo. A memória fica constante e o
     ritmo não degrada ao longo da execução.
 
-    Produz (lote_de_registros, n_do_lote, total_de_lotes).
+    Produz (RespostaBruta, n_do_lote, total_de_lotes). A RespostaBruta carrega
+    os bytes originais para que o consumidor registre a evidência ANTES de
+    derivar qualquer preço.
     """
     lotes = [ids[i:i + BATCH] for i in range(0, len(ids), BATCH)]
     janela = janela or workers * 2
@@ -266,10 +333,3 @@ def itera_registros(ids: list[str], workers: int = 4, janela: int | None = None)
                 if n % 100 == 0 or n == len(lotes):
                     log.info("  lote %d/%d (%.0fs)", n, len(lotes), time.time() - t0)
 
-
-def coleta_registros(ids: list[str], workers: int = 4) -> tuple[list[dict], int]:
-    """Versão não-streaming, para amostras pequenas e diagnóstico."""
-    registros: list[dict] = []
-    for parte, _, _ in itera_registros(ids, workers):
-        registros.extend(parte)
-    return registros, len(ids) - len(registros)
